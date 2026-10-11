@@ -78,7 +78,8 @@ wait_tip() {
     if [ "$(date +%s)" -ge "$next" ]; then tip="$(servers_tip "$net" 2>/dev/null || echo 0)"; printf '%s tip=%s %s\n' "$(date -u +%T)" "$tip" "$st" >> "$3"; next=$(( $(date +%s) + 30 )); fi
     if printf '%s' "$st" | python3 -I -c "
 import sys, json; v = json.load(sys.stdin); a = v.get('authority') or {}; k = v.get('kyoto') or {}
-ok = v.get('state') == 'ready' and v.get('synced') is True and (a.get('height') or 0) >= int(sys.argv[1] or 0) > 0
+tip = int(sys.argv[1] or 0)
+ok = v.get('state') == 'ready' and v.get('synced') is True and (a.get('height') or 0) >= tip > 0 and (v.get('walletTip') or 0) >= tip
 ok = ok and (a.get('kind') != 'kyoto' or k.get('phase') == 'synced')
 sys.exit(0 if ok else 1)" "${tip:-0}" 2>/dev/null; then return 0; fi
     sleep 5
@@ -125,7 +126,7 @@ if [[ " $PHASES " == *" restarts "* ]]; then
   for i in $(seq 1 "$RESTARTS"); do
     stamp "restart $i"
     close_net; tip="$(servers_tip signet)"
-    T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}"; T1=$(ms)
+    T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}" || echo "restart $i: open failed"; T1=$(ms)
     if wait_tip signet "$RESTART_SECS" "out/restart-$i.log"; then res=tip; else res=timeout; fi
     T2=$(ms)
     call $CORE status | python3 -I -c "
@@ -137,7 +138,9 @@ print(json.dumps({'run': $i, 'result': '$res', 'tipBefore': int('$tip' or 0), 'o
 fi
 
 if [[ " $PHASES " == *" testnet4 "* ]]; then
-  stamp "testnet4: sources as the node module offers them"
+  # Read late: the explorer's first height for testnet4 may arrive while signet runs.
+  [ -n "$TESTNET4_BIRTHDAY" ] || TESTNET4_BIRTHDAY="$(cat "$RUN/testnet4-birthday" 2>/dev/null || true)"
+  stamp "testnet4: sources as the node module offers them (birthday ${TESTNET4_BIRTHDAY:-none})"
   close_net
   save t4-set-network $CLI set_active_network testnet4
   for s in mempool.space mempool.space-onion; do save "t4-set-$s" $CLI set_source "$s" '{"use":true,"history":true}' > /dev/null; done

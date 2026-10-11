@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# The test wallet's view from mempool.space over our Tor: gap-limit address scan, every tx, balances.
-#   explorer.py <signet|testnet4> <tpub or wpkh descriptor> <out.json> [--gap N] [--stats-only]
+# The test wallet's view from an Esplora API over our Tor: gap-limit address scan, every tx, balances.
+#   explorer.py <signet|testnet4> <tpub or wpkh descriptor> <out.json> [--gap N] [--stats-only] [--host H]
+# Default host mempool.space (https); blockstream's onion is http. Failing circuits are retried, patiently.
 import json, os, queue, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -8,13 +9,14 @@ import derive, torget
 
 SOCK = os.path.expanduser(os.environ.get("TOR_SOCK", "~/btc-privacy-tests/tor/run/socks.sock"))
 WORKERS = 10
+HOST = sys.argv[sys.argv.index("--host") + 1] if "--host" in sys.argv else "mempool.space"
 POOL = queue.Queue()
-for _ in range(WORKERS): POOL.put(torget.Https(SOCK, "mempool.space"))
+for _ in range(WORKERS): POOL.put(torget.Https(SOCK, HOST))
 STATS = {"requests": 0, "retries": 0}
 LOCK = threading.Lock()
 
 
-def api(net, path, tries=10):
+def api(net, path, tries=60):
     c = POOL.get()
     try:
         for n in range(tries):
@@ -28,7 +30,7 @@ def api(net, path, tries=10):
                 err = repr(e)
             with LOCK: STATS["retries"] += 1
             print(f"  retry {n + 1}/{tries} {path[:70]}: {err}", file=sys.stderr, flush=True)
-            time.sleep(min(10, 2 ** n))
+            time.sleep(min(30, 2 ** n))
         raise RuntimeError(f"explorer: gave up on {path}")
     finally:
         POOL.put(c)
@@ -66,7 +68,11 @@ def main():
     xpub = derive.from_descriptor(key)[0] if key.startswith("wpkh(") else key
     t0 = time.time()
     with ThreadPoolExecutor(WORKERS) as ex:
-        tip = api(net, "/blocks/tip/height")
+        # Every connection builds its circuit at once; the ones that reach mempool.space are kept.
+        def warm(_):
+            try: return api(net, "/blocks/tip/height", tries=3)
+            except RuntimeError: return 0
+        tip = max(ex.map(warm, range(WORKERS))) or api(net, "/blocks/tip/height")
         addrs = scan(net, xpub, gap, ex)
         used = [a for a, v in addrs.items() if v["chain"]["tx_count"] + v["mempool"]["tx_count"]]
         res = {"network": net, "xpub": xpub, "gap": gap, "tipBefore": tip, "addresses": addrs,
@@ -89,7 +95,7 @@ def main():
             res["txs"] = rows
             res["firstHeight"] = min((r["height"] for r in rows if r["height"]), default=None)
         res["tipAfter"] = api(net, "/blocks/tip/height")
-    res["requests"], res["seconds"] = dict(STATS), round(time.time() - t0)
+    res["requests"], res["seconds"], res["host"] = dict(STATS), round(time.time() - t0), HOST
     json.dump(res, open(path, "w"), indent=1)
     print(json.dumps({"network": net, "used": len(used), "txs": len(res.get("txs", [])), "balance": res["balance"],
                       "firstHeight": res.get("firstHeight"), "tip": res["tipAfter"], "requests": STATS, "seconds": res["seconds"]}))

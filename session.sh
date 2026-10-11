@@ -67,7 +67,17 @@ PY
   call $KCLI approve_access @secret/decision.json > /dev/null; rm -f secret/decision.json
   until_for 300 'v.get("state") in ("done","failed","cancelled")' $CLI job_status "$jid" >> "out/$net-open-jobs.jsonl"; echo >> "out/$net-open-jobs.jsonl"
 }
-close_net() { call $CLI close_wallet > /dev/null; until_for 120 'v.get("state") == "no_wallet"' $CORE status > /dev/null; }
+# close_net [net]: closes, then waits for the backend to release the node module's lock on net (its 9 s tick).
+close_net() {
+  call $CLI close_wallet > /dev/null; until_for 120 'v.get("state") == "no_wallet"' $CORE status > /dev/null
+  [ -z "${1:-}" ] || until_for 60 "'$1' not in (v.get('walletOpen') or [])" $NODE config_status > /dev/null
+}
+# own_peers <net> <file>: the node module's own peers; fails loudly if refused.
+own_peers() {
+  save "$1-own-peers" $NODE set_own_peers "$1" "@$2" > /dev/null
+  python3 -I -c "import json,sys; v=json.load(open(sys.argv[1])); sys.exit(0 if v.get('ok') and v.get('ownPeers') else 1)" "out/$1-own-peers.json" \
+    || { echo "set_own_peers $1 refused: $(cat "out/$1-own-peers.json")"; return 1; }
+}
 # servers_tip <net>: the highest tip the node module's probes saw (address-free, through Tor).
 servers_tip() { call $NODE source_health "$1" | js 'max([int(s.get("tipHeight") or 0) for s in v.get("sources", [])] or [0])'; }
 # wait_tip <net> <secs> <log>: until the core is ready, synced and its authority reaches the servers' tip.
@@ -79,7 +89,9 @@ wait_tip() {
     if printf '%s' "$st" | python3 -I -c "
 import sys, json; v = json.load(sys.stdin); a = v.get('authority') or {}; k = v.get('kyoto') or {}
 tip = int(sys.argv[1] or 0)
-ok = v.get('state') == 'ready' and v.get('synced') is True and (a.get('height') or 0) >= tip > 0 and (v.get('walletTip') or 0) >= tip
+# No server tip (testnet4's servers unreachable): Kyoto's own synced, checked against the explorer afterwards.
+ref = tip if tip > 0 else (a.get('height') or 0) if k.get('phase') == 'synced' else 0
+ok = v.get('state') == 'ready' and v.get('synced') is True and (a.get('height') or 0) >= ref > 0 and (v.get('walletTip') or 0) >= ref
 ok = ok and (a.get('kind') != 'kyoto' or k.get('phase') == 'synced')
 sys.exit(0 if ok else 1)" "${tip:-0}" 2>/dev/null; then return 0; fi
     sleep 5
@@ -111,7 +123,7 @@ if [[ " $PHASES " == *" signet "* ]]; then
   stamp "signet: sources"
   save signet-set-network $CLI set_active_network signet
   for s in blockstream.info-onion blockstream.info mempool.space-onion mempool.space; do save "signet-set-$s" $CLI set_source "$s" '{"use":true,"history":true}' > /dev/null; done
-  save signet-own-peers $NODE set_own_peers signet "@$RUN/peers-signet.json" > /dev/null
+  own_peers signet "$RUN/peers-signet.json"
   node_reads signet signet-before
   stamp "signet: open"
   T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}"
@@ -125,7 +137,7 @@ fi
 if [[ " $PHASES " == *" restarts "* ]]; then
   for i in $(seq 1 "$RESTARTS"); do
     stamp "restart $i"
-    close_net; tip="$(servers_tip signet)"
+    close_net signet; tip="$(servers_tip signet)"
     T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}" || echo "restart $i: open failed"; T1=$(ms)
     if wait_tip signet "$RESTART_SECS" "out/restart-$i.log"; then res=tip; else res=timeout; fi
     T2=$(ms)
@@ -141,19 +153,21 @@ if [[ " $PHASES " == *" testnet4 "* ]]; then
   # Read late: the explorer's first height for testnet4 may arrive while signet runs.
   [ -n "$TESTNET4_BIRTHDAY" ] || TESTNET4_BIRTHDAY="$(cat "$RUN/testnet4-birthday" 2>/dev/null || true)"
   stamp "testnet4: sources as the node module offers them (birthday ${TESTNET4_BIRTHDAY:-none})"
-  close_net
+  close_net signet
   save t4-set-network $CLI set_active_network testnet4
   for s in mempool.space mempool.space-onion; do save "t4-set-$s" $CLI set_source "$s" '{"use":true,"history":true}' > /dev/null; done
   node_reads testnet4 t4-before
-  stamp "testnet4: open (shipped peer list)"
-  T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}"
-  if wait_tip testnet4 "$T4_SECS" out/t4-progress.log; then echo "TESTNET4 synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
-  else echo "TESTNET4 not at the tip after ${T4_SECS}s (shipped peer list)" | tee -a out/timings.txt; fi
-  stamp "testnet4: snapshot (shipped peer list)"; snapshot t4; node_reads testnet4 t4-after
+  if [ -z "${T4_SKIP_SHIPPED:-}" ]; then
+    stamp "testnet4: open (shipped peer list)"
+    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}"
+    if wait_tip testnet4 "$T4_SECS" out/t4-progress.log; then echo "TESTNET4 synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
+    else echo "TESTNET4 not at the tip after ${T4_SECS}s (shipped peer list)" | tee -a out/timings.txt; fi
+    stamp "testnet4: snapshot (shipped peer list)"; snapshot t4; node_reads testnet4 t4-after
+    close_net testnet4
+  fi
   if [ -s "$RUN/peers-testnet4.json" ]; then
     stamp "testnet4: the crawler's peer as own peer"
-    close_net
-    save t4-own-peers $NODE set_own_peers testnet4 "@$RUN/peers-testnet4.json" > /dev/null
+    own_peers testnet4 "$RUN/peers-testnet4.json"
     T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}"
     if wait_tip testnet4 "$T4_PEER_SECS" out/t4p-progress.log; then echo "TESTNET4 (own peer) synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
     else echo "TESTNET4 (own peer) not at the tip after ${T4_PEER_SECS}s" | tee -a out/timings.txt; fi

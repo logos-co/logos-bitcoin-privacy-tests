@@ -19,6 +19,6 @@ PY
 python3 -I "$HARNESS/peers_probe.py" "$RUN/peers-signet.json" "$RUN/peers-signet.json" 16
 env | grep -E '^(SIGNET_|TESTNET4_|T4_|PHASES|RESTART)' > "$RUN/params.env" || true
 date -u +%FT%TZ > "$RUN/started"
-bash "$HARNESS/cage.sh" "$RUN" "$SESSION" 2>&1 | tee "$RUN/cage.log"
+bash "$HARNESS/cage.sh" "$RUN" "$SESSION" 2>&1 | tee "$RUN/cage.log" || echo "cage exited non-zero; analysing anyway" | tee -a "$RUN/cage.log"
 date -u +%FT%TZ > "$RUN/finished"
 python3 -I "$HARNESS/analyze.py" "$RUN" | tee "$RUN/isolation.txt"

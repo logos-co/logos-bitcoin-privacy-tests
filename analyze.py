@@ -31,6 +31,7 @@ def loopback(a):
 def pcap(path, start, end):
     out = {"frames": 0, "bytes": 0, "sessionFrames": 0, "beforeSession": 0, "ifindex": collections.Counter(), "l3": collections.Counter(),
            "nonLoopback": [], "dnsFrames": [], "ports": collections.Counter()}
+    socks = collections.defaultdict(bytes)  # client bytes of each flow to the Tor bridge, in order
     with open(path, "rb") as f:
         gh = f.read(24)
         e = "<" if gh[:4] in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1") else ">"
@@ -65,10 +66,33 @@ def pcap(path, start, end):
                 out["nonLoopback"].append({"t": ts, "src": src, "dst": dst, "proto": name, "sport": sp, "dport": dp})
             if 53 in (sp, dp) and start <= ts <= end:
                 out["dnsFrames"].append({"t": ts, "src": src, "dst": dst, "sport": sp, "dport": dp})
+            if l4 == 6 and dp == 9050 and len(rest) >= 20 and len(socks[(src, sp)]) < 600 and ts >= start:
+                socks[(src, sp)] += rest[(rest[12] >> 4) * 4:]
             if sp is not None:
                 out["ports"][f"{name}/{min(sp, dp) if 9050 not in (sp, dp) and 53 not in (sp, dp) else (9050 if 9050 in (sp, dp) else 53)}"] += 1
     out["ports"] = dict(out["ports"].most_common(12))
+    out["socks"] = socks_requests(socks)
     return out
+
+
+def socks_requests(flows):
+    """SOCKS5 CONNECT targets per Tor stream: names go to Tor unresolved (ATYP 3); ATYP 1/4 would be literal IPs."""
+    dest, kinds, bad = collections.Counter(), collections.Counter(), 0
+    for b in flows.values():
+        try:
+            assert b[0] == 5
+            i = 2 + b[1]
+            if b[i] == 1: i += 3 + b[i + 1] + b[i + 2 + b[i + 1]]  # username/password sub-negotiation
+            assert b[i] == 5 and b[i + 1] == 1
+            atyp = b[i + 3]
+            if atyp == 3: host, j = b[i + 5:i + 5 + b[i + 4]].decode(), i + 5 + b[i + 4]
+            elif atyp == 1: host, j = ".".join(map(str, b[i + 4:i + 8])), i + 8
+            else: host, j = str(ipaddress.ip_address(b[i + 4:i + 20])), i + 20
+            dest[f"{host}:{int.from_bytes(b[j:j + 2], 'big')}"] += 1
+            kinds[{1: "ipv4", 3: "name", 4: "ipv6"}[atyp]] += 1
+        except (AssertionError, IndexError, UnicodeDecodeError, KeyError, ValueError):
+            bad += 1
+    return {"streams": len(flows), "byAddressType": dict(kinds), "unparsed": bad, "destinations": dict(dest.most_common())}
 
 
 def dns(path, start, end):
@@ -115,7 +139,7 @@ def strace(path):
         proc = who(pid)
         fam = re.search(r"sa_family=(AF_\w+)", rest)
         fam = fam.group(1) if fam else None
-        dec = re.match(r"\w+\((\d+)<([^>]*)>", rest)
+        dec = re.match(r"\w+\((\d+)<(\w+:\[.*?\])>", rest)
         result = rest.rsplit(" = ", 1)[1] if " = " in rest else "unfinished"
         res["counts"][f"{proc} {sc} {fam or 'no-addr'}"] += 1
         if fam == "AF_INET" or fam == "AF_INET6":
@@ -169,6 +193,9 @@ def main():
     print(f"strace connected-socket peers: {dict(list(s['connectedPeers'].items())[:12])}")
     print(f"strace unix paths: {dict(list(s['unixPaths'].items())[:40])}")
     print(f"socat (Tor bridge) connections: {out['socatConnections']}; canary strace: {out['canaryStrace']}")
+    sk = p["socks"]
+    print(f"SOCKS streams in the capture: {sk['streams']}, by address type {sk['byAddressType']}, unparsed {sk['unparsed']}")
+    for d, n in list(sk["destinations"].items())[:40]: print(f"  tor x{n}: {d}")
 
 
 if __name__ == "__main__":

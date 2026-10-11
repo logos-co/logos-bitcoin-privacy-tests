@@ -87,10 +87,16 @@ def main():
                 foreign_in = sum(1 for i in t["vin"] if (i.get("prevout") or {}).get("scriptpubkey_address") not in mine)
                 paid = sum(o["value"] for o in t["vout"] if o.get("scriptpubkey_address") not in mine)
                 st = t["status"]
+                pos = lambda a: [addrs[a]["branch"], addrs[a]["index"]]
+                ours_in = [i for i in t["vin"] if (i.get("prevout") or {}).get("scriptpubkey_address") in mine]
                 rows.append({"txid": t["txid"], "netSat": recv - spent, "recvSat": recv, "spentSat": spent, "paidForeignSat": paid,
                              "foreignInputs": foreign_in, "feeSat": t.get("fee"), "confirmed": st["confirmed"],
                              "height": st.get("block_height"), "blockHash": st.get("block_hash"), "time": st.get("block_time"),
-                             "spendsOurs": spent > 0})
+                             "spendsOurs": spent > 0,
+                             # Which of our keychain/index pairs it spends and pays, and the parents of our inputs.
+                             "insOurs": sorted(pos(i["prevout"]["scriptpubkey_address"]) for i in ours_in),
+                             "outsOurs": sorted(pos(o["scriptpubkey_address"]) for o in t["vout"] if o.get("scriptpubkey_address") in mine),
+                             "parentsOurs": sorted({i["txid"] for i in ours_in})})
             rows.sort(key=lambda r: (r["height"] or 1 << 31, r["txid"]))
             res["txs"] = rows
             res["firstHeight"] = min((r["height"] for r in rows if r["height"]), default=None)

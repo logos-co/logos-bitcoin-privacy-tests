@@ -8,6 +8,7 @@ CORE=bitcoin_wallet_core_module NODE=bitcoin_node_module CLI=bitcoin_wallet_cli 
 SIGNET_BIRTHDAY="${SIGNET_BIRTHDAY:-}" TESTNET4_BIRTHDAY="${TESTNET4_BIRTHDAY:-}"
 SIGNET_SYNC_SECS="${SIGNET_SYNC_SECS:-10800}" T4_SECS="${T4_SECS:-900}" T4_PEER_SECS="${T4_PEER_SECS:-5400}"
 RESTARTS="${RESTARTS:-10}" RESTART_SECS="${RESTART_SECS:-1200}" PHASES="${PHASES:-signet restarts testnet4}"
+SERVER_SECS="${SERVER_SECS:-}"  # set: the signet snapshot also waits that long for a history server's sync
 rc=1
 finish() { stamp "teardown"; call $CLI close_wallet > /dev/null 2>&1; sleep 5; ctl daemon stop > /dev/null 2>&1; sleep 3; echo "$rc" > "$RUN/cage/session.done"; }
 trap finish EXIT
@@ -135,6 +136,18 @@ node_reads() {  # node_reads <net> <prefix>
   save "$2-node-health" $NODE source_health "$1"
 }
 bday() { [ -n "$1" ] && printf ',"birthday":%s' "$1"; }
+# wait_server <secs> <log>: until a history server has synced (lastSync set) and two balance reads 60 s apart agree.
+wait_server() {
+  local end=$(( $(date +%s) + $1 )) prev="" cur ss
+  while [ "$(date +%s)" -lt "$end" ]; do
+    ss="$(call $CORE sources_status 2>/dev/null || true)"; printf '%s %s\n' "$(date -u +%T)" "$ss" >> "$2"
+    if printf '%s' "$ss" | python3 -I -c "import sys,json; v=json.load(sys.stdin); sys.exit(0 if [x for x in v.get('sources', []) if x.get('history') and x.get('lastSync')] else 1)" 2>/dev/null; then
+      cur="$(call $CORE balance 2>/dev/null)"; [ -n "$prev" ] && [ "$cur" = "$prev" ] && return 0; prev="$cur"; sleep 60; continue
+    fi
+    sleep 15
+  done
+  return 1
+}
 
 if [[ " $PHASES " == *" signet "* ]]; then
   stamp "signet: sources"
@@ -147,7 +160,14 @@ if [[ " $PHASES " == *" signet "* ]]; then
   stamp "signet: syncing"
   if wait_tip signet "$SIGNET_SYNC_SECS" out/signet-progress.log; then echo "SIGNET synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
   else echo "SIGNET not at the tip after ${SIGNET_SYNC_SECS}s" | tee -a out/timings.txt; fi
-  sleep 60   # one more history round after the tip
+  if [ -n "$SERVER_SECS" ]; then
+    stamp "signet: Kyoto-only snapshot"; snapshot signet-kyoto
+    stamp "signet: waiting for the history server's sync"; T1=$(ms)
+    if wait_server "$SERVER_SECS" out/signet-server-progress.log; then echo "SIGNET history server synced and stable $(( $(ms) - T1 )) ms after the tip" | tee -a out/timings.txt
+    else echo "SIGNET history server not synced after ${SERVER_SECS}s" | tee -a out/timings.txt; fi
+  else
+    sleep 60   # one more history round after the tip
+  fi
   stamp "signet: snapshot"; snapshot signet; node_reads signet signet-after
 fi
 

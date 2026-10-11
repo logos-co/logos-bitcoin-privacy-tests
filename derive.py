@@ -21,12 +21,36 @@ def add(p, q):
     return (x, (l * (p[0] - x) - p[1]) % P)
 
 
+def _jdouble(p):
+    x, y, z = p
+    if not y: return (0, 0, 0)
+    s = 4 * x * y * y % P; m = 3 * x * x % P
+    nx = (m * m - 2 * s) % P
+    return (nx, (m * (s - nx) - 8 * pow(y, 4, P)) % P, 2 * y * z % P)
+
+
+def _jadd(p, q):
+    if not p[2]: return q
+    if not q[2]: return p
+    z1s, z2s = p[2] * p[2] % P, q[2] * q[2] % P
+    u1, u2 = p[0] * z2s % P, q[0] * z1s % P
+    s1, s2 = p[1] * z2s * q[2] % P, q[1] * z1s * p[2] % P
+    if u1 == u2: return _jdouble(p) if s1 == s2 else (0, 0, 0)
+    h, r = (u2 - u1) % P, (s2 - s1) % P
+    h2 = h * h % P; h3 = h * h2 % P; u1h2 = u1 * h2 % P
+    nx = (r * r - h3 - 2 * u1h2) % P
+    return (nx, (r * (u1h2 - nx) - s1 * h3) % P, h * p[2] * q[2] % P)
+
+
 def mul(k, p=G):
-    r = None
+    # Jacobian coordinates: one inversion per multiplication instead of one per step.
+    r, q = (0, 0, 0), (p[0], p[1], 1)
     while k:
-        if k & 1: r = add(r, p)
-        p, k = add(p, p), k >> 1
-    return r
+        if k & 1: r = _jadd(r, q)
+        q, k = _jdouble(q), k >> 1
+    if not r[2]: return None
+    zi = pow(r[2], P - 2, P)
+    return (r[0] * zi * zi % P, r[1] * zi * zi * zi % P)
 
 
 def ser(p): return bytes([2 + (p[1] & 1)]) + p[0].to_bytes(32, "big")

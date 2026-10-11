@@ -1,14 +1,15 @@
 #!/bin/bash
 # The logosctl session (in the cage, under strace): keystore side, the Bitcoin modules, the public test phrase
-# restored, opened on signet then testnet4 read-only, Kyoto restarts. Usage: session.sh <run-dir> (cage.sh runs it)
+# restored and opened read-only, per PHASES (below). Usage: session.sh <run-dir> (cage.sh runs it)
 set -uo pipefail
 source "$(dirname "$0")/env.sh"; source "$HARNESS/lib.sh"
 RUN="$1"; cd "$RUN"; mkdir -p out home session/modules; mkdir -m 700 -p secret
 CORE=bitcoin_wallet_core_module NODE=bitcoin_node_module CLI=bitcoin_wallet_cli KCLI=evm_keystore_cli
 SIGNET_BIRTHDAY="${SIGNET_BIRTHDAY:-}" TESTNET4_BIRTHDAY="${TESTNET4_BIRTHDAY:-}"
-SIGNET_SYNC_SECS="${SIGNET_SYNC_SECS:-10800}" T4_SECS="${T4_SECS:-900}" T4_PEER_SECS="${T4_PEER_SECS:-5400}"
-RESTARTS="${RESTARTS:-10}" RESTART_SECS="${RESTART_SECS:-1200}" PHASES="${PHASES:-signet restarts testnet4}"
-SERVER_SECS="${SERVER_SECS:-}"  # set: the signet snapshot also waits that long for a history server's sync
+SIGNET_SYNC_SECS="${SIGNET_SYNC_SECS:-10800}" T4_SECS="${T4_SECS:-7200}" SERVER_SECS="${SERVER_SECS:-2700}"
+RESTARTS="${RESTARTS:-10}" RESTART_SECS="${RESTART_SECS:-1200}" SET_BIRTHDAY="${SET_BIRTHDAY:-196000}"
+# Phases, in this order: signet-kyoto restarts signet-servers testnet4 testnet4-servers nobirthday
+PHASES="${PHASES:-signet-kyoto restarts signet-servers testnet4 testnet4-servers}"
 rc=1
 finish() { stamp "teardown"; call $CLI close_wallet > /dev/null 2>&1; sleep 5; ctl daemon stop > /dev/null 2>&1; sleep 3; echo "$rc" > "$RUN/cage/session.done"; }
 trap finish EXIT
@@ -36,12 +37,8 @@ stamp "restore through evm_keystore_cli"
 call $KCLI import_bitcoin @secret/import.json > out/import.json; rm -f secret/import.json
 GROUP="$(js 'v["group"]' < out/import.json)"; echo "group $GROUP"
 
-stamp "node module; the test gate admits logosctl for set_own_peers"
-ctl module load $NODE; sleep 2
-NODE_DIR="$(find "$RUN/session/data/$NODE" -mindepth 1 -maxdepth 1 -type d | head -1)"
-printf '%s\n' '{"allowHost":true}' > "$NODE_DIR/callers.json"
-ctl module reload $NODE; sleep 2
-for m in $CORE bitcoin_wallet_backend $CLI; do ctl module load "$m"; done
+stamp "the Bitcoin modules"
+for m in $NODE $CORE bitcoin_wallet_backend $CLI; do ctl module load "$m"; done
 sleep 3
 stamp "enrol the CLI with the backend"
 ROLES="$(call $CLI status | js 'v["rolesFile"]')"
@@ -90,11 +87,10 @@ retry_ok() {
   done
   echo "refused: $n: $(cat "out/$n.json")"; return 1
 }
-# own_peers <net> <file>: the node module's own peers; fails loudly if refused.
+# own_peers <net> <file of a JSON array>: Kyoto's own peers through the CLI and the backend.
 own_peers() {
-  save "$1-own-peers" $NODE set_own_peers "$1" "@$2" > /dev/null
-  python3 -I -c "import json,sys; v=json.load(open(sys.argv[1])); sys.exit(0 if v.get('ok') and v.get('ownPeers') else 1)" "out/$1-own-peers.json" \
-    || { echo "set_own_peers $1 refused: $(cat "out/$1-own-peers.json")"; return 1; }
+  python3 -I -c "import json,sys; print(json.dumps({'network': sys.argv[1], 'peers': json.load(open(sys.argv[2]))}))" "$1" "$2" > "out/$1-own-peers-req.json"
+  retry_ok "$1-own-peers" $CLI set_own_peers "@$RUN/out/$1-own-peers-req.json"
 }
 # servers_tip <net>: the highest tip the node module's probes saw (address-free, through Tor).
 servers_tip() { call $NODE source_health "$1" | js 'max([int(s.get("tipHeight") or 0) for s in v.get("sources", [])] or [0])'; }
@@ -110,7 +106,7 @@ tip = int(sys.argv[1] or 0)
 # No server tip (testnet4's servers unreachable): Kyoto's own synced, checked against the explorer afterwards.
 ref = tip if tip > 0 else (a.get('height') or 0) if k.get('phase') == 'synced' else 0
 ok = v.get('state') == 'ready' and v.get('synced') is True and (a.get('height') or 0) >= ref > 0 and (v.get('walletTip') or 0) >= ref
-ok = ok and (a.get('kind') != 'kyoto' or k.get('phase') == 'synced')
+ok = ok and (a.get('kind') != 'kyoto' or k.get('phase') == 'synced') and v.get('rescanFrom') is None
 sys.exit(0 if ok else 1)" "${tip:-0}" 2>/dev/null; then return 0; fi
     sleep 5
   done
@@ -131,7 +127,7 @@ snapshot() {
   done
 }
 node_reads() {  # node_reads <net> <prefix>
-  save "$2-node-sources" $NODE get_sources "$1"; save "$2-node-routes" $NODE route_table "$1"
+  save "$2-node-sources" $NODE get_sources "$1"
   save "$2-node-peers" $NODE peer_list "$1"; save "$2-node-probe" $NODE probe "$1" str:
   save "$2-node-health" $NODE source_health "$1"
 }
@@ -149,67 +145,96 @@ wait_server() {
   return 1
 }
 
-if [[ " $PHASES " == *" signet "* ]]; then
-  stamp "signet: sources"
-  retry_ok signet-set-network $CLI set_active_network signet || exit 1
-  for s in blockstream.info-onion blockstream.info mempool.space-onion mempool.space; do retry_ok "signet-set-$s" $CLI set_source "$s" '{"use":true,"history":true}'; done
-  own_peers signet "$RUN/peers-signet.json"
-  node_reads signet signet-before
-  stamp "signet: open"
-  T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}" || { echo "signet open failed"; exit 1; }
-  stamp "signet: syncing"
-  if wait_tip signet "$SIGNET_SYNC_SECS" out/signet-progress.log; then echo "SIGNET synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
-  else echo "SIGNET not at the tip after ${SIGNET_SYNC_SECS}s" | tee -a out/timings.txt; fi
-  if [ -n "$SERVER_SECS" ]; then
-    stamp "signet: Kyoto-only snapshot"; snapshot signet-kyoto
-    stamp "signet: waiting for the history server's sync"; T1=$(ms)
-    if wait_server "$SERVER_SECS" out/signet-server-progress.log; then echo "SIGNET history server synced and stable $(( $(ms) - T1 )) ms after the tip" | tee -a out/timings.txt
-    else echo "SIGNET history server not synced after ${SERVER_SECS}s" | tee -a out/timings.txt; fi
-  else
-    sleep 60   # one more history round after the tip
+# kstat <status json on stdin>: the Kyoto and birthday fields a restart line or a phase keeps.
+kstat() { python3 -I -c "
+import sys, json; v = json.load(sys.stdin); k = v.get('kyoto') or {}
+print(json.dumps({'authority': v.get('authority'), 'birthday': v.get('birthday'), 'birthdaySource': v.get('birthdaySource'), 'rescanFrom': v.get('rescanFrom'),
+  'kyoto': {x: k.get(x) for x in ('phase', 'headers', 'quorum', 'onePeerDecides', 'connected', 'dialled', 'skipped', 'restarts', 'rebuilds', 'rescans', 'window', 'lastWarning', 'lastStop', 'lastConflict')}}))"; }
+# sync_phase <net> <label> <secs> <prefix> [server-secs]: open, wait for the tip (and a server's sync), snapshot.
+sync_phase() {
+  local net="$1" label="$2" secs="$3" p="$4" T0 T1
+  stamp "$label: open"
+  T0=$(ms); open_net "$net" "{\"family\":\"bitcoin\"$(bday "$5")}" || { echo "$label: open failed"; exit 1; }
+  if wait_tip "$net" "$secs" "out/$p-progress.log"; then echo "$label: at the tip in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
+  else echo "$label: not at the tip after ${secs}s" | tee -a out/timings.txt; fi
+  if [ -n "${6:-}" ]; then
+    T1=$(ms)
+    if wait_server "$6" "out/$p-server-progress.log"; then echo "$label: history server synced and stable $(( $(ms) - T1 )) ms after the tip" | tee -a out/timings.txt
+    else echo "$label: history server not synced after ${6}s" | tee -a out/timings.txt; fi
   fi
-  stamp "signet: snapshot"; snapshot signet; node_reads signet signet-after
+  call $CORE status | kstat > "out/$p-kyoto.json"
+  stamp "$label: snapshot"; snapshot "$p"; node_reads "$net" "$p-after"
+}
+# history_on <net> <prefix> <kind...>: history on for every source of those kinds the node module offers.
+history_on() {
+  local net="$1" p="$2"; shift 2
+  for id in $(python3 -I -c "import json,sys; print(' '.join(s['id'] for s in json.load(open(sys.argv[1]))['sources'] if s['kind'] in sys.argv[2:]))" "out/$p-node-sources.json" "$@"); do
+    retry_ok "$p-set-$id" $CLI set_source "$id" '{"use":true,"history":true}'
+  done
+}
+has() { [[ " $PHASES " == *" $1 "* ]]; }
+
+if has signet-kyoto; then
+  stamp "signet, Kyoto alone on the node module's verified list"
+  retry_ok sk-set-network $CLI set_active_network signet || exit 1
+  node_reads signet sk-before
+  sync_phase signet "signet Kyoto" "$SIGNET_SYNC_SECS" sk "$SIGNET_BIRTHDAY"
 fi
 
-if [[ " $PHASES " == *" restarts "* ]]; then
+if has restarts; then
   for i in $(seq 1 "$RESTARTS"); do
     stamp "restart $i"
     close_net signet; tip="$(servers_tip signet)"
-    T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}" || echo "restart $i: open failed"; T1=$(ms)
+    T0=$(ms); open_net signet "{\"family\":\"bitcoin\"}" || echo "restart $i: open failed"; T1=$(ms)
     if wait_tip signet "$RESTART_SECS" "out/restart-$i.log"; then res=tip; else res=timeout; fi
     T2=$(ms)
-    call $CORE status | python3 -I -c "
-import sys, json; v = json.load(sys.stdin); k = v.get('kyoto') or {}
-print(json.dumps({'run': $i, 'result': '$res', 'tipBefore': int('$tip' or 0), 'openMs': $T1 - $T0, 'syncMs': $T2 - $T1, 'totalMs': $T2 - $T0,
-  'authority': v.get('authority'), 'kyoto': {x: k.get(x) for x in ('phase', 'headers', 'connected', 'dialled', 'skipped', 'restarts', 'rebuilds', 'lastWarning', 'lastStop')}}))" | tee -a out/restarts.jsonl
+    call $CORE status | kstat | python3 -I -c "
+import sys, json; v = json.load(sys.stdin)
+v.update({'run': $i, 'result': '$res', 'tipBefore': int('$tip' or 0), 'openMs': $T1 - $T0, 'syncMs': $T2 - $T1, 'totalMs': $T2 - $T0}); print(json.dumps(v))" | tee -a out/restarts.jsonl
   done
   snapshot after-restarts
 fi
 
-if [[ " $PHASES " == *" testnet4 "* ]]; then
-  # Read late: the explorer's first height for testnet4 may arrive while signet runs.
-  [ -n "$TESTNET4_BIRTHDAY" ] || TESTNET4_BIRTHDAY="$(cat "$RUN/testnet4-birthday" 2>/dev/null || true)"
-  stamp "testnet4: sources as the node module offers them (birthday ${TESTNET4_BIRTHDAY:-none})"
+if has signet-servers; then
+  stamp "signet with every history server it offers"
+  close_net signet
+  retry_ok ss-set-network $CLI set_active_network signet || exit 1
+  node_reads signet ss-before
+  history_on signet ss-before esplora electrum
+  node_reads signet ss-before
+  sync_phase signet "signet servers" "$SIGNET_SYNC_SECS" ss "" "$SERVER_SECS"
+fi
+
+if has testnet4; then
+  stamp "testnet4 on the node module's defaults"
   close_net signet
   retry_ok t4-set-network $CLI set_active_network testnet4 || exit 1
-  for s in mempool.space mempool.space-onion; do retry_ok "t4-set-$s" $CLI set_source "$s" '{"use":true,"history":true}'; done
   node_reads testnet4 t4-before
-  if [ -z "${T4_SKIP_SHIPPED:-}" ]; then
-    stamp "testnet4: open (shipped peer list)"
-    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}" || { echo "testnet4 open failed"; exit 1; }
-    if wait_tip testnet4 "$T4_SECS" out/t4-progress.log; then echo "TESTNET4 synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
-    else echo "TESTNET4 not at the tip after ${T4_SECS}s (shipped peer list)" | tee -a out/timings.txt; fi
-    stamp "testnet4: snapshot (shipped peer list)"; snapshot t4; node_reads testnet4 t4-after
-    close_net testnet4
-  fi
-  if [ -s "$RUN/peers-testnet4.json" ]; then
-    stamp "testnet4: the crawler's peer as own peer"
-    own_peers testnet4 "$RUN/peers-testnet4.json"
-    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}" || { echo "testnet4 open failed"; exit 1; }
-    if wait_tip testnet4 "$T4_PEER_SECS" out/t4p-progress.log; then echo "TESTNET4 (own peer) synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
-    else echo "TESTNET4 (own peer) not at the tip after ${T4_PEER_SECS}s" | tee -a out/timings.txt; fi
-    sleep 60
-    stamp "testnet4: snapshot (own peer)"; snapshot t4p; node_reads testnet4 t4p-after
-  fi
+  sync_phase testnet4 "testnet4 defaults" "$T4_SECS" t4 "$TESTNET4_BIRTHDAY"
+fi
+
+if has testnet4-servers; then
+  stamp "testnet4 with every history server it offers"
+  close_net testnet4
+  retry_ok t4s-set-network $CLI set_active_network testnet4 || exit 1
+  node_reads testnet4 t4s-before
+  history_on testnet4 t4s-before esplora electrum
+  node_reads testnet4 t4s-before
+  sync_phase testnet4 "testnet4 servers" "$T4_SECS" t4s "" "$SERVER_SECS"
+fi
+
+if has nobirthday; then
+  stamp "signet restore without a birthday, then set_birthday $SET_BIRTHDAY"
+  close_net signet
+  retry_ok nb-set-network $CLI set_active_network signet || exit 1
+  T0=$(ms); open_net signet '{"family":"bitcoin"}' || { echo "no-birthday open failed"; exit 1; }
+  sleep 10; save nb-open-status $CORE status > /dev/null
+  r="$(call $CLI set_birthday "{\"height\":$SET_BIRTHDAY}")"; echo "$r" > out/nb-set-birthday.json
+  jid="$(printf '%s' "$r" | js 'v.get("jobId") or ""')"
+  until_for 300 'v.get("state") in ("done","failed","cancelled")' $CLI job_status "$jid" > out/nb-set-birthday-job.json || true
+  if wait_tip signet "$SIGNET_SYNC_SECS" out/nb-progress.log; then echo "no birthday, then set_birthday: at the tip in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
+  else echo "no birthday, then set_birthday: not at the tip after ${SIGNET_SYNC_SECS}s" | tee -a out/timings.txt; fi
+  call $CORE status | kstat > out/nb-kyoto.json
+  stamp "no birthday: snapshot"; snapshot nb; node_reads signet nb-after
 fi
 rc=0

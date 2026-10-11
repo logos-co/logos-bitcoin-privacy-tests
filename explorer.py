@@ -61,9 +61,22 @@ def txs_of(net, a):
     return out
 
 
+def extended_map(xpub, n):
+    """Address -> (keychain, index) for indices 0..n-1 on both keychains, past any gap."""
+    return {a: (b, i) for b in (0, 1) for i, a in enumerate(derive.addresses(xpub, b, 0, n, "tb"))}
+
+
+def ours(t, amap):
+    """Our inputs and outputs of a transaction as [keychain, index, value], by the given address map."""
+    ins = sorted([*amap[i["prevout"]["scriptpubkey_address"]], i["prevout"]["value"]] for i in t["vin"] if (i.get("prevout") or {}).get("scriptpubkey_address") in amap)
+    outs = sorted([*amap[o["scriptpubkey_address"]], o["value"]] for o in t["vout"] if o.get("scriptpubkey_address") in amap)
+    return ins, outs
+
+
 def main():
     net, key, path = sys.argv[1], sys.argv[2], sys.argv[3]
     gap = int(sys.argv[sys.argv.index("--gap") + 1]) if "--gap" in sys.argv else 20
+    ext = int(sys.argv[sys.argv.index("--ext") + 1]) if "--ext" in sys.argv else 600
     xpub = derive.from_descriptor(key)[0] if key.startswith("wpkh(") else key
     t0 = time.time()
     with ThreadPoolExecutor(WORKERS) as ex:
@@ -79,7 +92,7 @@ def main():
                            "mempool": sum(v["mempool"]["funded_txo_sum"] - v["mempool"]["spent_txo_sum"] for v in addrs.values())}}
         if "--stats-only" not in sys.argv:
             seen = {t["txid"]: t for lst in ex.map(lambda a: txs_of(net, a), used) for t in lst}
-            mine, rows = set(addrs), []
+            mine, rows, amap = set(addrs), [], extended_map(xpub, max(ext, max(v["index"] for v in addrs.values()) + 1))
             for t in seen.values():
                 recv = sum(o["value"] for o in t["vout"] if o.get("scriptpubkey_address") in mine)
                 spent = sum(i["prevout"]["value"] for i in t["vin"] if (i.get("prevout") or {}).get("scriptpubkey_address") in mine)
@@ -96,11 +109,13 @@ def main():
                              "insOurs": sorted(pos(i["prevout"]["scriptpubkey_address"]) for i in ours_in),
                              "outsOurs": sorted(pos(o["scriptpubkey_address"]) for o in t["vout"] if o.get("scriptpubkey_address") in mine),
                              "parentsOurs": sorted({i["txid"] for i in ours_in})})
+                # The same over every index to --ext, past the gap: [keychain, index, value].
+                rows[-1]["insExt"], rows[-1]["outsExt"] = ours(t, amap)
             rows.sort(key=lambda r: (r["height"] or 1 << 31, r["txid"]))
             res["txs"] = rows
             res["firstHeight"] = min((r["height"] for r in rows if r["height"]), default=None)
         res["tipAfter"] = api(net, "/blocks/tip/height")
-    res["requests"], res["seconds"], res["host"] = dict(STATS), round(time.time() - t0), HOST
+    res["requests"], res["seconds"], res["host"], res["ext"] = dict(STATS), round(time.time() - t0), HOST, ext
     json.dump(res, open(path, "w"), indent=1)
     print(json.dumps({"network": net, "used": len(used), "txs": len(res.get("txs", [])), "balance": res["balance"],
                       "firstHeight": res.get("firstHeight"), "tip": res["tipAfter"], "requests": STATS, "seconds": res["seconds"]}))

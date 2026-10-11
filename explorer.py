@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-# The test wallet's view from an Esplora API over our Tor: gap-limit address scan, every tx, balances.
+# The test wallet's view from an Esplora API (default mempool.space) over our Tor: gap-limit scan, every tx.
 #   explorer.py <signet|testnet4> <tpub or wpkh descriptor> <out.json> [--gap N] [--stats-only] [--host H]
-# Default host mempool.space (https); blockstream's onion is http. Failing circuits are retried, patiently.
 import json, os, queue, sys, threading, time
 from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

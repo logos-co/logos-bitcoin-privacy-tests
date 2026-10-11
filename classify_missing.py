@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-# Classifies what the wallet lacks, from an explorer scan with insOurs/outsOurs/parentsOurs: inside Kyoto's
-# initial watch window (indices < W) or not, a watched output or not, parents held by the wallet or not.
+# What the wallet lacks, by Kyoto's initial watch window (index < W), watched outputs and parents held.
 #   classify_missing.py <run-dir> <prefix> <explorer.json> [W=25]
 import collections, glob, json, sys
 

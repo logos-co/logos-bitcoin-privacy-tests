@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # For each transaction the wallet lacks: which of our addresses (keychain/index) it touches, as input or output.
 #   diag_missing.py <compare.json> <explorer.json> [--host H] -> per-tx lines and the lowest index touched
-import json, os, sys
+import json, os, sys, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import torget
 
@@ -17,7 +17,13 @@ c = torget.Https(os.path.expanduser("~/btc-privacy-tests/tor/run/socks.sock"), h
 rows = []
 for d in cmp["differences"]:
     if d["kind"] != "missing in wallet": continue
-    st, body = c.get(f"/{net}/api/tx/{d['txid']}")
+    for n in range(40):  # Tor exits fail often in front of this host: new circuit, back off, try again
+        try:
+            st, body = c.get(f"/{net}/api/tx/{d['txid']}")
+            if st == 200: break
+        except Exception as e:
+            print(f"  retry {n + 1} {d['txid'][:16]}: {e!r}"[:120], file=sys.stderr, flush=True)
+        c.close(); c.circuit = None; time.sleep(min(30, 2 ** n))
     t = json.loads(body)
     ins = sorted({idx[i["prevout"]["scriptpubkey_address"]] for i in t["vin"] if (i.get("prevout") or {}).get("scriptpubkey_address") in idx})
     outs = sorted({idx[o["scriptpubkey_address"]] for o in t["vout"] if o.get("scriptpubkey_address") in idx})

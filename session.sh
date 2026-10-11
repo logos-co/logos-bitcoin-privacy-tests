@@ -58,19 +58,36 @@ open_net() {
   [ -n "$handle" ] || handle="$(until_for 90 'v.get("openHandle")' $CLI wallet_status | js 'v["openHandle"]')"
   [ -n "$handle" ] || { echo "no open handle: $r"; return 1; }
   call $KCLI show_access "$handle" > secret/shown.json
+  # Approve only what this phase asked for: a request for another network is rejected.
+  if ! python3 -I -c "import json,sys; sys.exit(0 if json.load(open('secret/shown.json'))['asked']['network'] == sys.argv[1] else 1)" "$net"; then
+    echo "open asked for $(python3 -I -c "import json; print(json.load(open('secret/shown.json'))['asked'])"), not $net: rejected"
+    call $KCLI reject_access "$handle" > /dev/null; return 1
+  fi
   ( umask 077; python3 -I - "$GROUP" > secret/decision.json <<'PY'
 import json, sys
 s = json.load(open("secret/shown.json"))
 print(json.dumps({"handle": s["handle"], "bundle_id": s["bundle_id"], "group": sys.argv[1], "password": open("secret/pw.txt").read()}))
 PY
   )
-  call $KCLI approve_access @secret/decision.json > /dev/null; rm -f secret/decision.json
+  call $KCLI approve_access @secret/decision.json > "out/$net-approve.json" 2>&1; rm -f secret/decision.json
   until_for 300 'v.get("state") in ("done","failed","cancelled")' $CLI job_status "$jid" >> "out/$net-open-jobs.jsonl"; echo >> "out/$net-open-jobs.jsonl"
 }
 # close_net [net]: closes, then waits for the backend to release the node module's lock on net (its 9 s tick).
 close_net() {
-  call $CLI close_wallet > /dev/null; until_for 120 'v.get("state") == "no_wallet"' $CORE status > /dev/null
+  # A close with nothing open still starts a backend job, which then refuses network and source changes.
+  if [ "$(call $CORE status | js 'v.get("state")')" != no_wallet ]; then call $CLI close_wallet > /dev/null; fi
+  until_for 120 'v.get("state") == "no_wallet"' $CORE status > /dev/null
   [ -z "${1:-}" ] || until_for 60 "'$1' not in (v.get('walletOpen') or [])" $NODE config_status > /dev/null
+}
+# retry_ok <name> <call args...>: repeats a change until the backend accepts it (a pending job refuses it), up to 90 s.
+retry_ok() {
+  local n="$1"; shift
+  for _ in $(seq 45); do
+    save "$n" "$@" > /dev/null
+    python3 -I -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1])).get('ok') else 1)" "out/$n.json" 2>/dev/null && return 0
+    sleep 2
+  done
+  echo "refused: $n: $(cat "out/$n.json")"; return 1
 }
 # own_peers <net> <file>: the node module's own peers; fails loudly if refused.
 own_peers() {
@@ -121,12 +138,12 @@ bday() { [ -n "$1" ] && printf ',"birthday":%s' "$1"; }
 
 if [[ " $PHASES " == *" signet "* ]]; then
   stamp "signet: sources"
-  save signet-set-network $CLI set_active_network signet
-  for s in blockstream.info-onion blockstream.info mempool.space-onion mempool.space; do save "signet-set-$s" $CLI set_source "$s" '{"use":true,"history":true}' > /dev/null; done
+  retry_ok signet-set-network $CLI set_active_network signet || exit 1
+  for s in blockstream.info-onion blockstream.info mempool.space-onion mempool.space; do retry_ok "signet-set-$s" $CLI set_source "$s" '{"use":true,"history":true}'; done
   own_peers signet "$RUN/peers-signet.json"
   node_reads signet signet-before
   stamp "signet: open"
-  T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}"
+  T0=$(ms); open_net signet "{\"family\":\"bitcoin\"$(bday "$SIGNET_BIRTHDAY")}" || { echo "signet open failed"; exit 1; }
   stamp "signet: syncing"
   if wait_tip signet "$SIGNET_SYNC_SECS" out/signet-progress.log; then echo "SIGNET synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
   else echo "SIGNET not at the tip after ${SIGNET_SYNC_SECS}s" | tee -a out/timings.txt; fi
@@ -154,12 +171,12 @@ if [[ " $PHASES " == *" testnet4 "* ]]; then
   [ -n "$TESTNET4_BIRTHDAY" ] || TESTNET4_BIRTHDAY="$(cat "$RUN/testnet4-birthday" 2>/dev/null || true)"
   stamp "testnet4: sources as the node module offers them (birthday ${TESTNET4_BIRTHDAY:-none})"
   close_net signet
-  save t4-set-network $CLI set_active_network testnet4
-  for s in mempool.space mempool.space-onion; do save "t4-set-$s" $CLI set_source "$s" '{"use":true,"history":true}' > /dev/null; done
+  retry_ok t4-set-network $CLI set_active_network testnet4 || exit 1
+  for s in mempool.space mempool.space-onion; do retry_ok "t4-set-$s" $CLI set_source "$s" '{"use":true,"history":true}'; done
   node_reads testnet4 t4-before
   if [ -z "${T4_SKIP_SHIPPED:-}" ]; then
     stamp "testnet4: open (shipped peer list)"
-    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}"
+    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}" || { echo "testnet4 open failed"; exit 1; }
     if wait_tip testnet4 "$T4_SECS" out/t4-progress.log; then echo "TESTNET4 synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
     else echo "TESTNET4 not at the tip after ${T4_SECS}s (shipped peer list)" | tee -a out/timings.txt; fi
     stamp "testnet4: snapshot (shipped peer list)"; snapshot t4; node_reads testnet4 t4-after
@@ -168,7 +185,7 @@ if [[ " $PHASES " == *" testnet4 "* ]]; then
   if [ -s "$RUN/peers-testnet4.json" ]; then
     stamp "testnet4: the crawler's peer as own peer"
     own_peers testnet4 "$RUN/peers-testnet4.json"
-    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}"
+    T0=$(ms); open_net testnet4 "{\"family\":\"bitcoin\"$(bday "$TESTNET4_BIRTHDAY")}" || { echo "testnet4 open failed"; exit 1; }
     if wait_tip testnet4 "$T4_PEER_SECS" out/t4p-progress.log; then echo "TESTNET4 (own peer) synced in $(( $(ms) - T0 )) ms" | tee -a out/timings.txt
     else echo "TESTNET4 (own peer) not at the tip after ${T4_PEER_SECS}s" | tee -a out/timings.txt; fi
     sleep 60

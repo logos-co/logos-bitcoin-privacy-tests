@@ -4,7 +4,7 @@
 set -uo pipefail
 source "$(dirname "$0")/env.sh"; source "$HARNESS/lib.sh"
 RUN="$1"; cd "$RUN"; mkdir -p out home session/modules; mkdir -m 700 -p secret
-CORE=bitcoin_wallet_core_module NODE=bitcoin_node_module CLI=bitcoin_wallet_cli KCLI=evm_keystore_cli
+CORE=bitcoin_wallet_core_module NODE=bitcoin_node_module CLI=bitcoin_wallet_cli KCLI=evm_keystore_cli SCLI=evm_signer_cli
 SIGNET_BIRTHDAY="${SIGNET_BIRTHDAY:-}" TESTNET4_BIRTHDAY="${TESTNET4_BIRTHDAY:-}"
 SIGNET_SYNC_SECS="${SIGNET_SYNC_SECS:-10800}" T4_SECS="${T4_SECS:-7200}" SERVER_SECS="${SERVER_SECS:-2700}"
 RESTARTS="${RESTARTS:-10}" RESTART_SECS="${RESTART_SECS:-1200}" SET_BIRTHDAY="${SET_BIRTHDAY:-196000}"
@@ -16,7 +16,7 @@ trap finish EXIT
 export HOME="$RUN/home"
 
 stamp "lay out"
-for r in logos result-keystore result-manager result-kcli result-scli result-node result-core result-backend result-wcli; do cp -RL "$BUILDS/$r/modules/." session/modules/; done
+for r in $RESULTS; do cp -RL "$BUILDS/$r/modules/." session/modules/; done
 chmod -R u+w session/modules
 stamp "daemon start"; ctl daemon start --detach; sleep 3
 
@@ -38,7 +38,8 @@ call $KCLI import_bitcoin @secret/import.json > out/import.json; rm -f secret/im
 GROUP="$(js 'v["group"]' < out/import.json)"; echo "group $GROUP"
 
 stamp "the Bitcoin modules"
-for m in $NODE $CORE bitcoin_wallet_backend $CLI; do ctl module load "$m"; done
+node_on_our_tor || { echo "node module: our proxy or Use Tor for all refused: $(cat out/node-proxy.json out/node-tor-use.json)"; exit 1; }
+for m in $CORE bitcoin_wallet_backend $CLI; do ctl module load "$m"; done
 sleep 3
 stamp "enrol the CLI with the backend"
 ROLES="$(call $CLI status | js 'v["rolesFile"]')"
@@ -47,7 +48,8 @@ ctl module reload bitcoin_wallet_backend; sleep 3
 save cli-status $CLI status
 until_for 120 'v.get("state") == "configured"' $NODE config_status > out/node-config.json || true
 
-# open_net <net> <params>: opens through the CLI, decided by the custodian; the open job's state in out/.
+# open_net <net> <params>: opens through the CLI, consented in the signer CLI (the import left the wallet
+# unlocked for the session); the open job's state in out/.
 open_net() {
   local net="$1" r jid handle
   r="$(call $CLI open_wallet "$2")"; echo "$r" >> "out/$net-open-replies.jsonl"
@@ -55,19 +57,13 @@ open_net() {
   handle="$(printf '%s' "$r" | js 'v.get("openHandle") or ""')"
   [ -n "$handle" ] || handle="$(until_for 90 'v.get("openHandle")' $CLI wallet_status | js 'v["openHandle"]')"
   [ -n "$handle" ] || { echo "no open handle: $r"; return 1; }
-  call $KCLI show_access "$handle" > secret/shown.json
+  call $SCLI show_open "$handle" > "out/$net-shown.json"
   # Approve only what this phase asked for: a request for another network is rejected.
-  if ! python3 -I -c "import json,sys; sys.exit(0 if json.load(open('secret/shown.json'))['asked']['network'] == sys.argv[1] else 1)" "$net"; then
-    echo "open asked for $(python3 -I -c "import json; print(json.load(open('secret/shown.json'))['asked'])"), not $net: rejected"
-    call $KCLI reject_access "$handle" > /dev/null; return 1
+  if ! python3 -I -c "import json,sys; sys.exit(0 if (json.load(open(sys.argv[2])).get('asked') or {}).get('network') == sys.argv[1] else 1)" "$net" "out/$net-shown.json"; then
+    echo "open asked for $(cut -c1-300 "out/$net-shown.json"), not $net: rejected"
+    call $SCLI reject_open "$handle" > /dev/null; return 1
   fi
-  ( umask 077; python3 -I - "$GROUP" > secret/decision.json <<'PY'
-import json, sys
-s = json.load(open("secret/shown.json"))
-print(json.dumps({"handle": s["handle"], "bundle_id": s["bundle_id"], "group": sys.argv[1], "password": open("secret/pw.txt").read()}))
-PY
-  )
-  call $KCLI approve_access @secret/decision.json > "out/$net-approve.json" 2>&1; rm -f secret/decision.json
+  call $SCLI approve_open "$handle" "$(js 'v["bundle_id"]' < "out/$net-shown.json")" "str:$GROUP" > "out/$net-approve.json" 2>&1
   until_for 300 'v.get("state") in ("done","failed","cancelled")' $CLI job_status "$jid" >> "out/$net-open-jobs.jsonl"; echo >> "out/$net-open-jobs.jsonl"
 }
 # close_net [net]: closes, then waits for the backend to release the node module's lock on net (its 9 s tick).

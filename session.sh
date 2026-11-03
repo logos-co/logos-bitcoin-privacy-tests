@@ -200,7 +200,7 @@ if has signet-servers; then
   close_net signet
   retry_ok ss-set-network $CLI set_active_network signet || exit 1
   node_reads signet ss-before
-  history_on signet ss-before esplora electrum
+  history_on signet ss-before electrum
   node_reads signet ss-before
   sync_phase signet "signet servers" "$SIGNET_SYNC_SECS" ss "" "$SERVER_SECS"
 fi
@@ -218,7 +218,7 @@ if has testnet4-servers; then
   close_net testnet4
   retry_ok t4s-set-network $CLI set_active_network testnet4 || exit 1
   node_reads testnet4 t4s-before
-  history_on testnet4 t4s-before esplora electrum
+  history_on testnet4 t4s-before electrum
   node_reads testnet4 t4s-before
   sync_phase testnet4 "testnet4 servers" "$T4_SECS" t4s "" "$SERVER_SECS"
 fi

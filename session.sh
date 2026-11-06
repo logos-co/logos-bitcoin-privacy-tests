@@ -38,7 +38,7 @@ call $KCLI import_bitcoin @secret/import.json > out/import.json; rm -f secret/im
 GROUP="$(js 'v["group"]' < out/import.json)"; echo "group $GROUP"
 
 stamp "the Bitcoin modules"
-node_on_our_tor || { echo "node module: our proxy or Use Tor for all refused: $(cat out/node-proxy.json out/node-tor-use.json)"; exit 1; }
+node_on_our_tor || { echo "node module: our proxy or Use Tor for all refused: $(cat out/node-proxy.json out/node-tor-use.json out/node-tor-use-testnet4.json)"; exit 1; }
 for m in $CORE bitcoin_wallet_backend $CLI; do ctl module load "$m"; done
 sleep 3
 stamp "enrol the CLI with the backend"

@@ -31,8 +31,11 @@ node_on_our_tor() {
   printf '%s\n' '{"modules":[],"allowHost":true}' > "${d}callers.json"
   ctl module unload bitcoin_node_module; sleep 1; ctl module load bitcoin_node_module; sleep 2
   save node-proxy bitcoin_node_module set_proxy socks5h://127.0.0.1:9050 > /dev/null
-  save node-tor-use bitcoin_node_module set_tor_use all > /dev/null
-  python3 -I -c "import json,sys; sys.exit(0 if all(json.load(open(f)).get('ok') for f in sys.argv[1:]) else 1)" "$RUN/out/node-proxy.json" "$RUN/out/node-tor-use.json"
+  # Use Tor for is kept per network: both networks the session runs.
+  save node-tor-use bitcoin_node_module set_tor_use signet all > /dev/null
+  save node-tor-use-testnet4 bitcoin_node_module set_tor_use testnet4 all > /dev/null
+  python3 -I -c "import json,sys; sys.exit(0 if all(json.load(open(f)).get('ok') for f in sys.argv[1:]) else 1)" \
+    "$RUN/out/node-proxy.json" "$RUN/out/node-tor-use.json" "$RUN/out/node-tor-use-testnet4.json"
 }
 # The instance persistence directory of a loaded module, found by a file it keeps there.
 persist_dir() { dirname "$(find "$RUN/session" "$RUN/home" -path "*$1*" -name "$2" 2>/dev/null | head -1)"; }
